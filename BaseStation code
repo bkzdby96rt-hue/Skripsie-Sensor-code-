@@ -10,7 +10,7 @@
 #include <SPIFFS.h>
 #include <esp_wifi.h>
 
-// LoRa pins / config (same values, new names)
+// LoRa pins configs
 static const uint8_t LoraSck  = 12;
 static const uint8_t LoraMosi = 11;
 static const uint8_t LoraMiso = 1;
@@ -20,31 +20,31 @@ static const uint8_t LoraDio0 = 2;
 static const long    LoraFreq = 868100000;
 static const uint8_t LoraSync = 0x12;
 
-// AP credentials (shown on serial at boot); SSID gets MAC suffix
+//AP credentials to join wif
 const char* LoraBaseWifiSsid = "LORA_BASE";
 const char* LoraBaseWifiPass = "lorabase1";
 
-// HTTP server
+//HTTP server
 WebServer HttpServer(80);
 
-// logging
+//logging to csv and rung buffer which fills and trhen deletes ress 
 const char* LogPath = "/lora_log.csv";
 const size_t MaxLogBytes = 512UL * 1024UL;
 
-// recent ring buffer
+//recent ring buffer
 struct Rec { unsigned long Ms; String Payload; int Rssi; float Snr; };
 const size_t RecentMax = 600;
 Rec   RecentBuf[RecentMax];
 size_t RecentHead = 0;
 size_t RecentCount = 0;
 
-// last seen packet (for /api/latest)
+//last seen packet for the api to displau
 String       LastPayload = "";
 int          LastRssi    = 0;
 float        LastSnr     = 0.0f;
 unsigned long LastMs     = 0;
 
-// --- helpers ---------------------------------------------------------------
+//helpers 
 
 void addRecent(const String& p, int rssi, float snr, unsigned long ms) {
   RecentBuf[RecentHead] = Rec{ ms, p, rssi, snr };
@@ -64,14 +64,13 @@ void appendLog(const String& payload, int rssi, float snr, unsigned long ms) {
   size_t sz = f ? f.size() : 0;
   if (f) f.close();
 
-  if (sz > MaxLogBytes) {           // too big? start fresh with header
+  if (sz > MaxLogBytes) {           // if too big start fresh with header
     SPIFFS.remove(LogPath);
     ensureLogHeader();
   }
 
   File w = SPIFFS.open(LogPath, FILE_APPEND);
   if (!w) return;
-
   w.print(ms); w.print(',');
   String safe = payload; safe.replace("\"", "'");
   w.print('"'); w.print(safe); w.print('"');
@@ -80,7 +79,7 @@ void appendLog(const String& payload, int rssi, float snr, unsigned long ms) {
   w.close();
 }
 
-// --- minimal UI (unchanged) -----------------------------------------------
+// UI TO DISPLSAY The data 
 
 const char DashHtml[] PROGMEM = R"HTML(
 <!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>LoRa Base</title>
@@ -187,7 +186,7 @@ document.getElementById('clearBtn').addEventListener('click',async(e)=>{e.preven
 </body></html>
 )HTML";
 
-// --- HTTP handlers ---------------------------------------------------------
+// HTTP handlers
 
 void handleRoot() {
   HttpServer.send(200, "text/html; charset=utf-8", DashHtml);
@@ -243,7 +242,7 @@ void handleClear() {
   HttpServer.send(200, "text/plain", "OK");
 }
 
-// --- Wi-Fi AP bring-up -----------------------------------------------------
+//Wi-Fi AP bringup
 
 bool startAp() {
   WiFi.persistent(false);
@@ -267,7 +266,7 @@ bool startAp() {
   return ok;
 }
 
-// --- Arduino entry points --------------------------------------------------
+//Storing and setting up
 
 void setup() {
   Serial.begin(115200);
