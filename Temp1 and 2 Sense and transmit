@@ -1,0 +1,70 @@
+#include <Arduino.h>
+#include <esp32-hal-adc.h>
+
+// ADC setup for full 3.3V range
+#ifndef ADC_ATTEN_DB_11
+  #ifdef ADC_11db
+    #define ADC_ATTEN_DB_11 ADC_11db
+  #else
+    #define ADC_ATTEN_DB_11 ((adc_attenuation_t)3)
+  #endif
+#endif
+
+// Pinsand constant
+static const uint8_t PtPin =39;// GPIO39
+static const float Vcc= 3.32f;// Vsupp
+static const float Rref =467.0f;// fixed ref resistor
+static const float R0= 100.0f; // PT100 resistance at 0°C
+
+// CVD T≥0°C
+static const float CvdA= 3.9083e-3f;
+static const float CvdB =-5.775e-7f;
+
+// Lead wire measured
+static float Rleads= 3.20f;
+
+// average ADC readings in millivolts
+static inline int32_t ReadMilliVoltsAvg(uint8_t pin,int samples=128) {
+  int32_t sum =0;
+  for (int i =0; i< samples;++i)
+    sum +=analogReadMilliVolts(pin);
+  return sum/samples;
+}
+
+// conv measured node voltage to R
+static inline float VnodeToRmeas(float vNode) {
+  if (vNode <=0.005f||vNode>=(Vcc-0.005f))
+    return NAN;
+  return (Rref*vNode)/(Vcc-vNode);
+}
+// conv R to T with CVD
+static inline float RtoT(float R) {
+  if (R<= 1.0f) return NAN;
+  float x= R/R0;
+  float disc = CvdA*CvdA- 4.0f* CvdB*(1.0f-x);
+  if (disc < 0.0f) return NAN;
+  return (-CvdA +sqrtf(disc))/(2.0f* CvdB);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+  analogReadResolution(12);
+  analogSetPinAttenuation(PtPin, ADC_ATTEN_DB_11);
+  delay(100);
+}
+
+void loop() {
+  // read V, Cacl T
+  float vNode= ReadMilliVoltsAvg(PtPin, 64)/1000.0f;
+  float rRaw  =VnodeToRmeas(vNode);
+  float rCorr =isnan(rRaw) ? NAN :(rRaw-Rleads);
+  float tempC =isnan(rCorr)? NAN: RtoT(rCorr);
+  // print result
+  if (isnan(tempC))
+    Serial.println("nan");
+  else
+    Serial.println(tempC, 2);
+
+  delay(250);
+}
