@@ -1,0 +1,327 @@
+//base station code for the reciever and outputting
+
+
+#include <Arduino.h>
+#include <SPI.h>
+#include <LoRa.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <FS.h>
+#include <SPIFFS.h>
+#include <esp_wifi.h>
+
+// LoRa pins / config (same values, new names)
+static const uint8_t LoraSck  = 12;
+static const uint8_t LoraMosi = 11;
+static const uint8_t LoraMiso = 1;
+static const uint8_t LoraSs   = 10;
+static const uint8_t LoraRst  = 9;
+static const uint8_t LoraDio0 = 2;
+static const long    LoraFreq = 868100000;
+static const uint8_t LoraSync = 0x12;
+
+// AP credentials (shown on serial at boot); SSID gets MAC suffix
+const char* LoraBaseWifiSsid = "LORA_BASE";
+const char* LoraBaseWifiPass = "lorabase1";
+
+// HTTP server
+WebServer HttpServer(80);
+
+// logging
+const char* LogPath = "/lora_log.csv";
+const size_t MaxLogBytes = 512UL * 1024UL;
+
+// recent ring buffer
+struct Rec { unsigned long Ms; String Payload; int Rssi; float Snr; };
+const size_t RecentMax = 600;
+Rec   RecentBuf[RecentMax];
+size_t RecentHead = 0;
+size_t RecentCount = 0;
+
+// last seen packet (for /api/latest)
+String       LastPayload = "";
+int          LastRssi    = 0;
+float        LastSnr     = 0.0f;
+unsigned long LastMs     = 0;
+
+// --- helpers ---------------------------------------------------------------
+
+void addRecent(const String& p, int rssi, float snr, unsigned long ms) {
+  RecentBuf[RecentHead] = Rec{ ms, p, rssi, snr };
+  RecentHead = (RecentHead + 1) % RecentMax;
+  if (RecentCount < RecentMax) RecentCount++;
+}
+
+void ensureLogHeader() {
+  if (!SPIFFS.exists(LogPath)) {
+    File f = SPIFFS.open(LogPath, FILE_WRITE);
+    if (f) { f.println("millis,payload,rssi,snr"); f.close(); }
+  }
+}
+
+void appendLog(const String& payload, int rssi, float snr, unsigned long ms) {
+  File f = SPIFFS.open(LogPath, FILE_READ);
+  size_t sz = f ? f.size() : 0;
+  if (f) f.close();
+
+  if (sz > MaxLogBytes) {           // too big? start fresh with header
+    SPIFFS.remove(LogPath);
+    ensureLogHeader();
+  }
+
+  File w = SPIFFS.open(LogPath, FILE_APPEND);
+  if (!w) return;
+
+  w.print(ms); w.print(',');
+  String safe = payload; safe.replace("\"", "'");
+  w.print('"'); w.print(safe); w.print('"');
+  w.print(','); w.print(rssi);
+  w.print(','); w.println(snr, 2);
+  w.close();
+}
+
+// --- minimal UI (unchanged) -----------------------------------------------
+
+const char DashHtml[] PROGMEM = R"HTML(
+<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>LoRa Base</title>
+<style>
+body{font-family:system-ui,Segoe UI,Roboto,Arial;margin:1.2rem;max-width:980px}
+.grid{display:grid;gap:1rem;grid-template-columns:repeat(auto-fit,minmax(260px,1fr))}
+.card{border:1px solid #ddd;border-radius:12px;padding:1rem}
+.k{color:#666;font-size:.9rem}.v{font-size:1.8rem;font-weight:700}
+table{width:100%;border-collapse:collapse;margin-top:1rem}
+th,td{border-bottom:1px solid #eee;padding:.5rem;text-align:left;font-size:.9rem}
+.btn{display:inline-block;padding:.5rem .8rem;border-radius:8px;border:1px solid #ccc;text-decoration:none}
+.actions{display:flex;gap:.6rem;align-items:center;margin-top:.6rem}
+small{color:#666}
+canvas{width:100%;height:260px;display:block}
+.metric{display:flex;gap:1.5rem;margin-top:.5rem}
+.metric div{font-size:.95rem;color:#333}
+.metric b{font-size:1.05rem}
+</style></head><body>
+<h1>LoRa Base Station</h1>
+<div class=grid>
+  <div class=card>
+    <div class=k>Latest payload</div>
+    <div id=payload class=v>--</div>
+    <div class=k>RSSI: <span id=rssi>--</span>&nbsp; SNR: <span id=snr>--</span></div>
+    <div class=k>Millis: <span id=ms>--</span></div>
+    <div class=metric>
+      <div>Max |G|: <b id=maxg>--</b></div>
+      <div>Max |I|: <b id=maxi>--</b></div>
+      <div>Freq: <b id=freq>--</b></div>
+    </div>
+    <div class=actions>
+      <a class=btn href=/download>Download CSV</a>
+      <a class=btn href=# id=clearBtn>Clear Log</a>
+    </div>
+    <small>Auto-refreshes every 1s</small>
+  </div>
+</div>
+<div class=card>
+  <div class=k>Waveform (last 600 samples)</div>
+  <canvas id=c></canvas>
+</div>
+<div class=card>
+  <div class=k>Recent (up to 200)</div>
+  <table id=tbl><thead><tr><th>Millis</th><th>Payload</th><th>RSSI</th><th>SNR</th></tr></thead><tbody></tbody></table>
+</div>
+<script>
+let g=[],i=[],t=[];
+const C=document.getElementById('c'),X=C.getContext('2d');
+function draw(){
+  const w=C.clientWidth,h=260; if(C.width!==w) C.width=w; C.height=h;
+  X.clearRect(0,0,w,h);
+  if(g.length<2) return;
+  let gmin=Math.min(...g),gmax=Math.max(...g);
+  let imin=Math.min(...i),imax=Math.max(...i);
+  function yf(v,vmin,vmax){if(vmax===vmin){vmax=vmin+1;} return h-10-((v-vmin)/(vmax-vmin))*(h-20);}
+  X.lineWidth=1.5;
+  X.beginPath(); for(let k=0;k<g.length;k++){let x=(k/(g.length-1))*w; let y=yf(g[k],gmin,gmax); if(k===0)X.moveTo(x,y); else X.lineTo(x,y);} X.stroke();
+  X.beginPath(); for(let k=0;k<i.length;k++){let x=(k/(i.length-1))*w; let y=yf(i[k],imin,imax); if(k===0)X.moveTo(x,y); else X.lineTo(x,y);} X.stroke();
+  document.getElementById('maxg').textContent=(Math.max(Math.abs(gmin),Math.abs(gmax))).toFixed(1)+' G';
+  document.getElementById('maxi').textContent=(Math.max(Math.abs(imin),Math.abs(imax))).toFixed(2)+' A';
+  let f='0.00 Hz';
+  if(t.length>5){
+    let y=g,mu=y.reduce((a,b)=>a+b,0)/y.length,zc=[];
+    for(let k=1;k<y.length;k++){let a=y[k-1]-mu,b=y[k]-mu;if(a<=0&&b>0){zc.push(t[k]);}}
+    if(zc.length>=2){let periods=[]; for(let k=1;k<zc.length;k++) periods.push(zc[k]-zc[k-1]);
+      let med=periods.sort((a,b)=>a-b)[Math.floor(periods.length/2)];
+      if(med>0){f=(1000.0/med).toFixed(2)+' Hz';}
+    }
+  }
+  document.getElementById('freq').textContent=f;
+}
+async function getJSON(u){const r=await fetch(u,{cache:'no-store'});return r.json();}
+async function refresh(){
+  try{
+    const latest=await getJSON('/api/latest');
+    document.getElementById('payload').textContent=latest.payload||'--';
+    document.getElementById('rssi').textContent=latest.rssi??'--';
+    document.getElementById('snr').textContent=(latest.snr??'--');
+    document.getElementById('ms').textContent=latest.ms??'--';
+    if(latest.payload&&latest.payload.startsWith('{')){
+      try{
+        const o=JSON.parse(latest.payload);
+        if(Number.isFinite(o.G)&&Number.isFinite(o.I)&&Number.isFinite(latest.ms)){
+          g.push(o.G); i.push(o.I); t.push(latest.ms);
+          if(g.length>600){g=g.slice(-600);i=i.slice(-600);t=t.slice(-600);}
+          draw();
+        }
+      }catch(e){}
+    }
+    const recent=await getJSON('/api/recent');
+    const tb=document.querySelector('#tbl tbody'); tb.innerHTML='';
+    const n=Math.min(200,recent.length);
+    for(let idx=0;idx<n;idx++){
+      const row=recent[idx];
+      const tr=document.createElement('tr');
+      tr.innerHTML=`<td>${row.ms}</td><td>${row.payload}</td><td>${row.rssi}</td><td>${row.snr}</td>`;
+      tb.appendChild(tr);
+    }
+  }catch(e){}
+}
+setInterval(refresh,1000); refresh();
+document.getElementById('clearBtn').addEventListener('click',async(e)=>{e.preventDefault();await fetch('/api/clear',{method:'POST'});g=[];i=[];t=[];draw();});
+</script>
+</body></html>
+)HTML";
+
+// --- HTTP handlers ---------------------------------------------------------
+
+void handleRoot() {
+  HttpServer.send(200, "text/html; charset=utf-8", DashHtml);
+}
+
+void handleLatest() {
+  String j = "{";
+  j += "\"payload\":\"" + String(LastPayload) + "\",";
+  j += "\"rssi\":" + String(LastRssi) + ",";
+  j += "\"snr\":" + String(LastSnr, 2) + ",";
+  j += "\"ms\":" + String(LastMs);
+  j += "}";
+  HttpServer.sendHeader("Cache-Control", "no-store");
+  HttpServer.send(200, "application/json", j);
+}
+
+void handleRecent() {
+  String out = "[";
+  if (RecentCount > 0) {
+    for (size_t i = 0; i < RecentCount; ++i) {
+      size_t idx = (RecentHead + RecentMax - 1 - i) % RecentMax;
+      const Rec& r = RecentBuf[idx];
+      out += "{\"ms\":" + String(r.Ms)
+          +  ",\"payload\":\"" + String(r.Payload) + "\""
+          +  ",\"rssi\":" + String(r.Rssi)
+          +  ",\"snr\":" + String(r.Snr, 2) + "}";
+      if (i + 1 < RecentCount) out += ",";
+    }
+  }
+  out += "]";
+  HttpServer.sendHeader("Cache-Control", "no-store");
+  HttpServer.send(200, "application/json", out);
+}
+
+void handleDownload() {
+  if (!SPIFFS.exists(LogPath)) { HttpServer.send(404, "text/plain", "No log"); return; }
+  File f = SPIFFS.open(LogPath, FILE_READ);
+  if (!f) { HttpServer.send(500, "text/plain", "Open failed"); return; }
+  HttpServer.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  HttpServer.send(200, "text/csv", "");
+  uint8_t buf[1024];
+  while (true) {
+    size_t n = f.read(buf, sizeof(buf));
+    if (!n) break;
+    HttpServer.client().write(buf, n);
+  }
+  f.close();
+}
+
+void handleClear() {
+  if (SPIFFS.exists(LogPath)) SPIFFS.remove(LogPath);
+  ensureLogHeader();
+  HttpServer.send(200, "text/plain", "OK");
+}
+
+// --- Wi-Fi AP bring-up -----------------------------------------------------
+
+bool startAp() {
+  WiFi.persistent(false);
+  WiFi.disconnect(true, true);
+  WiFi.mode(WIFI_OFF);
+  delay(100);
+  WiFi.mode(WIFI_AP);
+
+  String ssid = String(LoraBaseWifiSsid);
+  uint8_t mac[6]; 
+  WiFi.softAPmacAddress(mac);
+  ssid += "-"; ssid += String(mac[4], HEX); ssid += String(mac[5], HEX);
+
+  bool ok = WiFi.softAP(ssid.c_str(), LoraBaseWifiPass, 1, 0, 4);
+  if (!ok) { delay(200); ok = WiFi.softAP(ssid.c_str(), LoraBaseWifiPass, 1, 0, 4); }
+
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+
+  Serial.print("AP SSID: "); Serial.println(ssid);
+  Serial.print("AP  IP : ");  Serial.println(WiFi.softAPIP());
+  return ok;
+}
+
+// --- Arduino entry points --------------------------------------------------
+
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  if (!SPIFFS.begin(true)) {
+    Serial.println("SPIFFS mount failed, continuing...");
+  }
+  ensureLogHeader();
+
+  startAp();
+
+  HttpServer.on("/",           handleRoot);
+  HttpServer.on("/api/latest", handleLatest);
+  HttpServer.on("/api/recent", handleRecent);
+  HttpServer.on("/download",   handleDownload);
+  HttpServer.on("/api/clear",  HTTP_POST, handleClear);
+  HttpServer.begin();
+
+  SPI.begin(LoraSck, LoraMiso, LoraMosi, LoraSs);
+  LoRa.setPins(LoraSs, LoraRst, LoraDio0);
+  if (LoRa.begin(LoraFreq)) {
+    LoRa.setSyncWord(LoraSync);
+    Serial.println("LoRa up.");
+  } else {
+    Serial.println("LoRa begin failed.");
+  }
+}
+
+void loop() {
+  int sz = LoRa.parsePacket();
+  if (sz) {
+    String payload = "";
+    while (LoRa.available()) payload += (char)LoRa.read();
+
+    int rssi = LoRa.packetRssi();
+    float snr = LoRa.packetSnr();
+    unsigned long ms = millis();
+
+    LastPayload = payload;
+    LastRssi = rssi;
+    LastSnr = snr;
+    LastMs = ms;
+
+    addRecent(payload, rssi, snr, ms);
+    appendLog(payload, rssi, snr, ms);
+
+    Serial.print("[LoRa] ");
+    Serial.print(ms);
+    Serial.print(" RSSI="); Serial.print(rssi);
+    Serial.print(" SNR=");  Serial.print(snr, 2);
+    Serial.print(" ");
+    Serial.println(payload);
+  }
+
+  HttpServer.handleClient();
+}
