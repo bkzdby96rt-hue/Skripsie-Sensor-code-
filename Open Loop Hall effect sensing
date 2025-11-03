@@ -1,0 +1,78 @@
+#include <Arduino.h>
+//pin setup for hall effect sensor
+static const int pinHall=33;
+static const float rup=9940.0f, rdown=21800.0f;
+static const float divf=(rdown/(rup+rdown));
+static float sens_mV_per_G=3.125f;
+static float vzero=2.598f;
+//calibration constants
+static float a_per_g=0.3819f;
+static float i_off=0.0f;
+static float i_fs=30.0f;
+uint32_t tprint=0;
+
+//handler to read gauss out using adc
+float readG(){
+  float vadc=(float)analogReadMilliVolts(pinHall);
+  float vsens=vadc/divf;
+  float dmV=vsens-(vzero*1000.0f);
+  return dmV/sens_mV_per_G;
+}
+//start cde
+void setup(){
+  Serial.begin(115200);
+  delay(150);
+  analogReadResolution(12);
+  analogSetPinAttenuation(pinHall,ADC_ATTENDB_MAX);
+}
+
+void loop(){
+  if(millis()-tprint>=200){
+    tprint=millis();
+    float g=readG();
+    float i=a_per_g*g+i_off;
+    if(i> i_fs) i=i_fs;
+    if(i<-i_fs) i=-i_fs;
+    Serial.printf("G=%.2f G, I=%.3f A\n",g,i);
+  }
+//print serial out
+  while(Serial.available()){
+    String s=Serial.readStringUntil('\n'); s.trim(); if(!s.length()) break;
+//zeroin runtime function
+    if(s=="z"||s=="Z"){
+      const uint16_t N=150; float acc=0;
+      for(uint16_t i=0;i<N;++i){ acc+= (float)analogReadMilliVolts(pinHall)/divf; delay(10); }
+      vzero=(acc/N)/1000.0f;
+      Serial.printf("Zero=%.4f V\n",vzero);
+    }
+    else if(s.startsWith("cal ")){
+      int spc=s.indexOf(' ',4);
+      float a=s.substring(4,spc).toFloat();
+      float b=s.substring(spc+1).toFloat();
+      if(isfinite(a)) a_per_g=a;
+      if(isfinite(b)) i_off=b;
+      Serial.printf("cal: a=%.6f A/G, b=%.6f A\n",a_per_g,i_off);
+    }
+    else if(s.startsWith("cal2 ")){
+      float g1,g2,i1,i2; int p1=s.indexOf(' ',5);
+      int p2=s.indexOf(' ',p1+1); int p3=s.indexOf(' ',p2+1);
+      g1=s.substring(5,p1).toFloat(); i1=s.substring(p1+1,p2).toFloat();
+      g2=s.substring(p2+1,p3).toFloat(); i2=s.substring(p3+1).toFloat();
+      float a=(g2!=g1)?(i2-i1)/(g2-g1):a_per_g; float b=i1-a*g1;
+      if(isfinite(a)) a_per_g=a; if(isfinite(b)) i_off=b;
+      Serial.printf("cal2: a=%.6f A/G, b=%.6f A\n",a_per_g,i_off);
+    }
+    else if(s.startsWith("fs ")){
+      float fs=s.substring(3).toFloat(); if(fs>0.1f) i_fs=fs;
+      Serial.printf("fs=%.3f A\n",i_fs);
+    }
+    else if(s.startsWith("sens ")){
+      float k=s.substring(5).toFloat(); if(k>0.01f) sens_mV_per_G=k;
+      Serial.printf("sens=%.4f mV/G\n",sens_mV_per_G);
+    }
+    else if(s.startsWith("v0 ")){
+      float v=s.substring(3).toFloat(); if(v>0.1f&&v<4.9f) vzero=v;
+      Serial.printf("Zero=%.4f V\n",vzero);
+    }
+  }
+}
