@@ -1,0 +1,126 @@
+#include <Arduino.h>
+#include <esp32-hal-adc.h>
+#include <math.h>
+
+//Pin COnfig setup
+static const int PinHallAdc=33;
+static const int PinPwm=25;
+static const int PinDir1=27;
+static const int PinDir2=14;
+
+//constants based on rel vals 
+static const float RUp=9940.0f;
+static const float RDown=21800.0f;
+static const float DivF=(RDown/(RUp+RDown));
+
+static float SensmVPerG=3.125f;
+static float VzeroV=2.598f;
+
+static float RloadOhms=99.8f;
+
+//Calibration constanst
+static float FitAPos=5.178f;
+static float FitBPos=-0.145f;
+static float FitANeg=4.466f;
+static float FitBNeg=0.181f;
+//COntroller vals for P control
+static volatile float Kp=0.0020f;
+static volatile float DeadbandG=50.0f;
+static volatile float TauMs=100.0f;
+static int Polarity=+1;
+
+static bool HoldMode=false;
+static float HoldDuty=0.0f;
+static int HoldDir=LOW;
+
+static bool CoastAtZero=false;
+
+#ifndef ADC_ATTEN_DB_11
+  #ifdef ADC_11db
+    #define ADC_ATTEN_DB_11 ADC_11db
+  #else
+    #define ADC_ATTEN_DB_11 ((adc_attenuation_t)3)
+  #endif
+#endif
+
+static inline int32_t ReadMilliVoltsAvg(uint8_t pin,int samples=64){int64_t s=0;for(int i=0;i<samples;++i)s+=analogReadMilliVolts(pin);return (int32_t)(s/samples);}
+static float ReadGaussOnce(){float vadc_mV=(float)ReadMilliVoltsAvg(PinHallAdc,64);
+float vsens_mV=vadc_mV/DivF;
+float delta_mV=vsens_mV-(VzeroV*1000.0f);
+return delta_mV/SensmVPerG;}
+
+static void SafeSetDirAndPwm(int dirHL,int duty8){
+  analogWrite(PinPwm,0);
+  if(dirHL==LOW){digitalWrite(PinDir1,HIGH);digitalWrite(PinDir2,LOW);}else{digitalWrite(PinDir1,LOW);digitalWrite(PinDir2,HIGH);}
+  delayMicroseconds(2);
+  analogWrite(PinPwm,duty8);
+}
+
+static void ApplyOutput(float duty01,int dirHL){
+  duty01=constrain(duty01,0.0f,1.0f);
+  int duty8=(int)lroundf(duty01*255.0f);duty8=constrain(duty8,0,255);
+  if(duty8==0){ if(CoastAtZero){digitalWrite(PinDir1,HIGH);digitalWrite(PinDir2,HIGH);analogWrite(PinPwm,0);}else{digitalWrite(PinDir1,LOW);digitalWrite(PinDir2,LOW);analogWrite(PinPwm,0);} return; }
+  SafeSetDirAndPwm(dirHL,duty8);
+}
+
+static float EstimateVresV(float duty01,int dirHL){
+  duty01=constrain(duty01,0.0f,1.0f);
+  bool dirPlus=(dirHL==LOW);
+  float V=dirPlus?(FitAPos*duty01+FitBPos):(FitANeg*duty01+FitBNeg);
+  return V;
+}
+
+static float EmaG=0.0f;static bool EmaInit=false;
+static uint32_t LastSample=0;static uint32_t TPrint=0;
+//begin setup and initialisation
+void setup(){
+  Serial.begin(115200);delay(200);
+  analogReadResolution(12);
+  analogSetPinAttenuation(PinHallAdc,ADC_ATTEN_DB_11);
+  pinMode(PinDir1,OUTPUT);pinMode(PinDir2,OUTPUT);digitalWrite(PinDir1,HIGH);digitalWrite(PinDir2,LOW);
+  pinMode(PinPwm,OUTPUT);analogWriteResolution(PinPwm,8);analogWriteFrequency(PinPwm,25000);analogWrite(PinPwm,0);
+}
+
+void loop(){
+  if(millis()-LastSample>=2000){
+    LastSample=millis();
+    float g=ReadGaussOnce();
+    if(!EmaInit){EmaG=g;EmaInit=true;}
+    float dt_ms=2000.0f;float a=dt_ms/(TauMs+dt_ms);a=constrain(a,0.001f,0.999f);EmaG+=a*(g-EmaG);
+  }
+
+  float duty=0.0f;int dirHL=LOW;
+  if(HoldMode){duty=HoldDuty;dirHL=HoldDir;}
+  else{
+    float ge=EmaG*Polarity;
+    if(fabsf(ge)>DeadbandG){float mag=fabsf(ge)-DeadbandG;duty=Kp*mag;dirHL=(ge>0.0f)?LOW:HIGH;}
+    else{duty=0.0f;dirHL=LOW;}
+  }
+
+  ApplyOutput(duty,dirHL);
+
+  if(millis()-TPrint>=2000){
+    TPrint=millis();
+    float VresV=EstimateVresV(duty,dirHL);
+    float IA=(RloadOhms>0.01f)?(VresV/RloadOhms):0.0f;
+    char dirChar=(dirHL==HIGH)?'-':'+';
+    Serial.printf("G=%.2f G, I=%.6f A, Vres=%.1f mV, dir=%c\n",EmaG,IA,VresV*1000.0f,dirChar);
+  }
+
+  while(Serial.available()){
+    String s=Serial.readStringUntil('\n');s.trim();if(!s.length())break;
+    if(s=="z"||s=="Z"){const uint16_t N=150;float acc_mV=0;for(uint16_t i=0;i<N;++i){acc_mV+=(float)ReadMilliVoltsAvg(PinHallAdc,32)/DivF;delay(10);}VzeroV=(acc_mV/N)/1000.0f;EmaInit=false;Serial.printf("Zero=%.4f V\n",VzeroV);}
+    else if(s.startsWith("p ")){Kp=s.substring(2).toFloat();Serial.printf("Kp=%.5f\n",Kp);}
+    else if(s.startsWith("d ")){DeadbandG=max(0.0f,s.substring(2).toFloat());Serial.printf("deadband=%.1f G\n",DeadbandG);}
+    else if(s=="m"||s=="M"){Polarity=-Polarity;Serial.printf("Polarity=%+d\n",Polarity);}
+    else if(s.startsWith("t ")){float v=s.substring(2).toFloat();TauMs=constrain(v,1.0f,500.0f);Serial.printf("tau=%.1f ms\n",TauMs);}
+    else if(s.startsWith("freq ")){uint32_t hz=(uint32_t)s.substring(5).toInt();hz=constrain(hz,100u,120000u);analogWriteFrequency(PinPwm,hz);Serial.printf("PWM=%u Hz\n",hz);}
+    else if(s.startsWith("hold ")){int spc=s.indexOf(' ',5);float v=s.substring(5,spc).toFloat();char sign=(spc>0&&spc+1<(int)s.length())?s.charAt(spc+1):'+';HoldDuty=constrain(v,0.0f,1.0f);HoldDir=(sign=='-')?HIGH:LOW;HoldMode=true;ApplyOutput(HoldDuty,HoldDir);Serial.printf("HOLD duty=%.3f dir=%c\n",HoldDuty,(HoldDir==HIGH)?'-':'+');}
+    else if(s=="run"||s=="RUN"){HoldMode=false;Serial.println("RUN");}
+    else if(s.startsWith("fit+ ")){int spc=s.indexOf(' ',5);float A=s.substring(5,spc).toFloat();float BmV=s.substring(spc+1).toFloat();if(A>0.01f&&A<10.0f)FitAPos=A;FitBPos=BmV/1000.0f;Serial.printf("fit+ : A=%.3f V/duty, B=%.1f mV\n",FitAPos,BmV);}
+    else if(s.startsWith("fit- ")){int spc=s.indexOf(' ',5);float A=s.substring(5,spc).toFloat();float BmV=s.substring(spc+1).toFloat();if(A>0.01f&&A<10.0f)FitANeg=A;FitBNeg=BmV/1000.0f;Serial.printf("fit- : A=%.3f V/duty, B=%.1f mV\n",FitANeg,BmV);}
+    else if(s.startsWith("coast ")){CoastAtZero=(s.substring(6).toInt()!=0);Serial.printf("coast at zero: %s\n",CoastAtZero?"ON":"OFF");}
+  }
+
+  delay(5);
+}
